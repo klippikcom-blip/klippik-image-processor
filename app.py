@@ -351,23 +351,32 @@ def fetch_image(url: str) -> bytes:
 
 
 def to_avif(raw: bytes, quality: int = AVIF_QUALITY) -> bytes:
-    """Decode → normalise → resize to 1200×1200 (letterboxed) → AVIF encode."""
+    """Decode → flatten transparency onto white → scale to fit 1200×1200
+    (letterboxed) → AVIF encode."""
     img = Image.open(io.BytesIO(raw))
 
-    # Normalise colour mode
+    # ── Flatten ANY transparency onto a white background ──
+    # Palette PNGs (mode "P") often carry transparency whose hidden underlying
+    # colour is NOT white (e.g. green). Convert to RGBA first and composite,
+    # rather than naively dropping the alpha — otherwise that hidden colour
+    # bleeds through as the background.
+    if img.mode == "P":
+        img = img.convert("RGBA")
     if img.mode in ("RGBA", "LA", "PA"):
-        bg = Image.new("RGB", img.size, (255, 255, 255))
-        if img.mode == "PA":
-            img = img.convert("RGBA")
-        bg.paste(img, mask=img.split()[-1])
+        rgba = img.convert("RGBA")
+        bg = Image.new("RGB", rgba.size, (255, 255, 255))
+        bg.paste(rgba, mask=rgba.split()[-1])
         img = bg
-    elif img.mode == "P":
-        img = img.convert("RGBA").convert("RGB")
     elif img.mode != "RGB":
         img = img.convert("RGB")
 
-    # Resize maintaining aspect ratio
-    img.thumbnail(TARGET_SIZE, Image.LANCZOS)
+    # ── Scale to FIT 1200×1200, preserving aspect ratio ──
+    # Scales up small source images as well as down, so the product always
+    # fills the frame instead of sitting tiny in a sea of white padding.
+    w, h = img.size
+    scale = min(TARGET_SIZE[0] / w, TARGET_SIZE[1] / h)
+    new_size = (max(1, round(w * scale)), max(1, round(h * scale)))
+    img = img.resize(new_size, Image.LANCZOS)
 
     # Letterbox on white 1200×1200 canvas
     canvas = Image.new("RGB", TARGET_SIZE, (255, 255, 255))
