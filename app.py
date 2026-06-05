@@ -11,6 +11,7 @@ Supports two database backends:
   • SQLite    — automatic fallback for local / Windows use
 """
 
+import base64
 import io
 import json
 import os
@@ -391,6 +392,87 @@ def to_avif(raw: bytes, quality: int = AVIF_QUALITY) -> bytes:
     return buf.getvalue()
 
 
+# ── AI Vision Alt Text ─────────────────────────────────────────────────────────
+# Default to a fast, cheap vision-capable model; override via secrets if needed.
+VISION_MODEL = "claude-haiku-4-5-20251001"
+
+
+def _anthropic_key() -> str:
+    try:
+        k = st.secrets.get("ANTHROPIC_API_KEY", "")
+    except Exception:
+        k = ""
+    return k or os.environ.get("ANTHROPIC_API_KEY", "")
+
+
+def _vision_model() -> str:
+    try:
+        m = st.secrets.get("VISION_MODEL", "")
+    except Exception:
+        m = ""
+    return m or os.environ.get("VISION_MODEL", "") or VISION_MODEL
+
+
+def ai_alt_enabled() -> bool:
+    return bool(_anthropic_key())
+
+
+@st.cache_data(show_spinner=False)
+def describe_image(img_bytes: bytes, product_name: str) -> str:
+    """Use Claude vision to produce a short phrase describing THIS image's
+    actual content (angle / view / notable detail / setting). Returns '' on any
+    failure so the caller can fall back to a generic positional label.
+    Cached per (image, product) so re-processing doesn't re-bill the API."""
+    key = _anthropic_key()
+    if not key:
+        return ""
+    try:
+        import anthropic
+    except Exception:
+        return ""
+
+    # Detect media type from magic bytes (Claude accepts jpeg/png/webp/gif).
+    media = "image/jpeg"
+    if img_bytes[:8].startswith(b"\x89PNG"):
+        media = "image/png"
+    elif img_bytes[:4] == b"RIFF" and img_bytes[8:12] == b"WEBP":
+        media = "image/webp"
+    elif img_bytes[:6] in (b"GIF87a", b"GIF89a"):
+        media = "image/gif"
+
+    try:
+        client = anthropic.Anthropic(api_key=key)
+        b64 = base64.standard_b64encode(img_bytes).decode("ascii")
+        prompt = (
+            f"This is one product photo of '{product_name}'. In 4 to 9 words, "
+            "describe what THIS specific image shows: the camera angle/view and any "
+            "notable visible detail or setting. Examples: 'back view showing dual "
+            "camera cutout', 'held in hand outdoors', 'close-up of textured side "
+            "grip', 'front and back shown side by side'. Do NOT include the product "
+            "name, brand, or colour. No quotation marks. Reply with only the phrase."
+        )
+        msg = client.messages.create(
+            model=_vision_model(),
+            max_tokens=40,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {
+                        "type": "base64", "media_type": media, "data": b64}},
+                    {"type": "text", "text": prompt},
+                ],
+            }],
+        )
+        txt = "".join(
+            getattr(b, "text", "") for b in msg.content
+            if getattr(b, "type", "") == "text"
+        ).strip()
+        txt = txt.strip().strip('"').strip("'").rstrip(".").strip()
+        return txt[:90]
+    except Exception:
+        return ""
+
+
 # ── Alt Text ───────────────────────────────────────────────────────────────────
 
 def extract_color(name: str, url: str) -> str:
@@ -401,13 +483,19 @@ def extract_color(name: str, url: str) -> str:
     return ""
 
 
-def make_alt(product_name: str, color: str, idx: int, region: str = "kw") -> str:
+def make_alt(product_name: str, color: str, idx: int, region: str = "kw",
+             detail: str = "") -> str:
     """
     Generate SEO alt text for a given region.
     region: 'kw' | 'ae' | 'in' | 'gb'
+    `detail` is an AI-generated description of THIS image's actual content.
+    If empty, falls back to a generic positional view label.
     For 'gb', a country code is cycled deterministically across image indices.
     """
-    view      = VIEW_LABELS[idx] if idx < len(VIEW_LABELS) else f"View {idx + 1}"
+    if detail:
+        view = detail
+    else:
+        view = VIEW_LABELS[idx] if idx < len(VIEW_LABELS) else f"View {idx + 1}"
     color_str = f" in {color}" if color else ""
     base      = f"{product_name}{color_str} – {view} | KlippiK"
 
@@ -419,13 +507,13 @@ def make_alt(product_name: str, color: str, idx: int, region: str = "kw") -> str
         return f"{base}{suffix}"
 
 
-def make_all_alts(product_name: str, color: str, idx: int) -> dict:
+def make_all_alts(product_name: str, color: str, idx: int, detail: str = "") -> dict:
     """Return alt text for all 4 regions for a single image index."""
     return {
-        "alt_kw": make_alt(product_name, color, idx, "kw"),
-        "alt_ae": make_alt(product_name, color, idx, "ae"),
-        "alt_in": make_alt(product_name, color, idx, "in"),
-        "alt_gb": make_alt(product_name, color, idx, "gb"),
+        "alt_kw": make_alt(product_name, color, idx, "kw", detail),
+        "alt_ae": make_alt(product_name, color, idx, "ae", detail),
+        "alt_in": make_alt(product_name, color, idx, "in", detail),
+        "alt_gb": make_alt(product_name, color, idx, "gb", detail),
     }
 
 
@@ -464,6 +552,13 @@ st.caption(
     "Paste a product URL · Crawl gallery · Resize 1200×1200 · "
     "Convert to AVIF · Generate alt text · Download ZIP · Track duplicates"
 )
+if ai_alt_enabled():
+    st.caption("✨ AI alt text: **ON** — descriptions are generated from each actual image.")
+else:
+    st.caption(
+        "⚙️ AI alt text: **off** — using generic view labels. "
+        "Add `ANTHROPIC_API_KEY` in the app's Settings → Secrets to describe real image content."
+    )
 st.divider()
 
 # ── URL Input ──
@@ -605,14 +700,22 @@ if crawl:
                 prog = st.progress(0.0, text="Starting…")
                 status_box = st.empty()
 
+                use_ai = ai_alt_enabled()
+                ai_hits = 0
                 for step, (orig_i, img_url) in enumerate(chosen):
-                    prog.progress(step / len(chosen), text=f"Image {step + 1}/{len(chosen)}…")
+                    label = "Describing & converting" if use_ai else "Converting"
+                    prog.progress(step / len(chosen), text=f"{label} image {step + 1}/{len(chosen)}…")
                     status_box.caption(f"Processing: {img_url[:80]}…")
                     try:
                         raw       = fetch_image(img_url)
                         avif_data = to_avif(raw, quality)
                         fname     = f"{slug}_{orig_i + 1:02d}.avif"
-                        alts      = make_all_alts(active_name or "Product", color, orig_i)
+                        # AI alt text describes the ACTUAL image (from the source
+                        # bytes — Claude reads jpeg/png/webp, not AVIF).
+                        detail    = describe_image(raw, active_name or "Product") if use_ai else ""
+                        if detail:
+                            ai_hits += 1
+                        alts      = make_all_alts(active_name or "Product", color, orig_i, detail)
                         avif_results.append((fname, avif_data))
                         all_alts.append(alts)
                         filenames.append(fname)
@@ -624,6 +727,13 @@ if crawl:
 
                 for err in errors:
                     st.warning(f"⚠️ {err}")
+
+                if use_ai and avif_results and ai_hits == 0:
+                    st.warning(
+                        "⚠️ AI alt text was enabled but every description failed — "
+                        "fell back to generic view labels. Check that `ANTHROPIC_API_KEY` "
+                        "is valid and the `VISION_MODEL` is available on your account."
+                    )
 
                 if avif_results:
                     # Save to local disk
