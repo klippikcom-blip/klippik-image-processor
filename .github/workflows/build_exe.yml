@@ -1,49 +1,45 @@
 name: Build Windows EXE
 
-# Triggers: every push to main, OR manually via GitHub UI
 on:
   push:
     branches: [main]
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build-windows:
     runs-on: windows-latest
 
     steps:
-      # ── 1. Checkout code ──────────────────────────────────────────────────
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ── 2. Python 3.11 ────────────────────────────────────────────────────
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      # ── 3. Install all dependencies + PyInstaller ─────────────────────────
       - name: Install dependencies
         run: |
           pip install --upgrade pip
           pip install -r requirements.txt
           pip install pyinstaller
 
-      # ── 4. Build EXE using the spec file ─────────────────────────────────
       - name: Build with PyInstaller
         run: pyinstaller klippik_processor.spec
 
-      # ── 5. Verify the EXE was created ────────────────────────────────────
       - name: Verify build
         run: |
           dir dist
           if (!(Test-Path "dist\KlippiK_Image_Processor.exe")) {
-            Write-Error "EXE not found — build failed"
+            Write-Error "EXE not found"
             exit 1
           }
           $size = (Get-Item "dist\KlippiK_Image_Processor.exe").length / 1MB
           Write-Host "EXE size: $([math]::Round($size, 1)) MB"
 
-      # ── 6. Upload EXE as workflow artifact (always available) ─────────────
       - name: Upload EXE artifact
         uses: actions/upload-artifact@v4
         with:
@@ -51,8 +47,6 @@ jobs:
           path: dist/KlippiK_Image_Processor.exe
           retention-days: 90
 
-      # ── 7. Create a GitHub Release and attach the EXE ────────────────────
-      #    Only runs on push to main (not on manual dispatch without tag)
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -61,23 +55,12 @@ jobs:
           body: |
             ## KlippiK Image Processor — Windows EXE
 
-            ### What's included
-            - Crawl product URLs (DailyObjects and others)
-            - Resize images to 1200×1200
-            - Convert to high-quality AVIF
-            - Generate alt text for all 4 sub-sites (KW / AE / IN / GB)
-            - Duplicate detection
-            - Download ZIP with AVIF files + alt_texts.csv
-
-            ### How to use
+            **How to use:**
             1. Download `KlippiK_Image_Processor.exe` below
-            2. Double-click it — browser opens automatically
+            2. Double-click — browser opens automatically
             3. Paste a product URL and click Crawl
 
-            > Note: Windows may show a SmartScreen warning on first launch.
-            > Click "More info" → "Run anyway" — this is safe.
+            > Windows SmartScreen warning on first launch: click "More info" → "Run anyway"
           files: dist/KlippiK_Image_Processor.exe
           draft: false
           prerelease: false
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
