@@ -29,7 +29,7 @@ from PIL import Image
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 TARGET_SIZE  = (1200, 1200)
-AVIF_QUALITY = 85          # default; user can adjust via slider
+AVIF_QUALITY = 90          # default; user can adjust via slider
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH    = os.path.join(SCRIPT_DIR, "klippik_image_records.db")
@@ -199,20 +199,44 @@ def crawl_page(url: str):
     resp.raise_for_status()
     soup = BeautifulSoup(resp.text, "html.parser")
 
-    # ── Product name ──
+    raw_html = resp.text
+
+    # ── Product name (prefer JSON-LD Product.name, then h1/og/title) ──
     product_name = ""
-    for fn in [
-        lambda s: s.find("h1"),
-        lambda s: s.find("meta", property="og:title"),
-        lambda s: s.find("title"),
-    ]:
-        el = fn(soup)
-        if el:
-            raw = el.get("content", "") or el.get_text()
-            candidate = raw.split("|")[0].split(" – ")[0].split(" - ")[0].strip()
-            if candidate:
-                product_name = candidate
-                break
+    primary_image = ""
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(script.string or "")
+        except Exception:
+            continue
+        for item in (data if isinstance(data, list) else [data]):
+            if isinstance(item, dict) and item.get("@type") == "Product":
+                if not product_name:
+                    product_name = (item.get("name") or "").strip()
+                im = item.get("image")
+                if isinstance(im, list) and im:
+                    primary_image = primary_image or im[0]
+                elif isinstance(im, str):
+                    primary_image = primary_image or im
+
+    if not product_name:
+        for fn in [
+            lambda s: s.find("h1"),
+            lambda s: s.find("meta", property="og:title"),
+            lambda s: s.find("title"),
+        ]:
+            el = fn(soup)
+            if el:
+                raw = el.get("content", "") or el.get_text()
+                candidate = raw.split("|")[0].split("—")[0].split(" – ")[0].split(" - ")[0].strip()
+                if candidate:
+                    product_name = candidate
+                    break
+
+    if not primary_image:
+        og = soup.find("meta", property=re.compile(r"og:image", re.I))
+        if og:
+            primary_image = og.get("content", "")
 
     image_urls: list[str] = []
     seen: set[str] = set()
@@ -235,36 +259,54 @@ def crawl_page(url: str):
             seen.add(clean)
             image_urls.append(clean)
 
-    # Strategy 1 — __NEXT_DATA__ (Next.js / Shopify Hydrogen)
-    nd = soup.find("script", id="__NEXT_DATA__")
-    if nd and nd.string:
-        for u in re.findall(
-            r'https://[^\s"\'\\]+\.(?:jpg|jpeg|png|webp)',
-            nd.string, re.IGNORECASE,
-        ):
-            low = u.lower()
-            if any(x in low for x in ["cdn","media","image","product","gallery","upload"]):
-                if not any(x in low for x in ["_50","_100","_150","_200","thumb","logo","icon"]):
+    all_html_imgs = re.findall(
+        r'https://[^\s"\'\\]+?\.(?:jpg|jpeg|png|webp)', raw_html, re.IGNORECASE,
+    )
+
+    # Strategy 0 (primary) — same CDN folder as the main product image.
+    # Most stores (DailyObjects, Shopify, etc.) keep one product's full gallery
+    # in a single folder, while add-on / related products live in other folders.
+    # This reliably captures the COMPLETE gallery and excludes cross-sell images.
+    if primary_image:
+        folder = _clean_url(primary_image).rsplit("/", 1)[0] + "/"
+        if folder.startswith("http") and len(folder) > 12:
+            for u in all_html_imgs:
+                if _clean_url(u).startswith(folder):
                     add(u)
 
-    # Strategy 2 — JSON-LD Product schema
-    for script in soup.find_all("script", type="application/ld+json"):
-        try:
-            data = json.loads(script.string or "")
-            blob = json.dumps(data)
+    # Strategy 1 — __NEXT_DATA__ (Next.js / Shopify Hydrogen)
+    if len(image_urls) < 2:
+        nd = soup.find("script", id="__NEXT_DATA__")
+        if nd and nd.string:
             for u in re.findall(
                 r'https://[^\s"\'\\]+\.(?:jpg|jpeg|png|webp)',
-                blob, re.IGNORECASE,
+                nd.string, re.IGNORECASE,
             ):
-                add(u)
-        except Exception:
-            pass
+                low = u.lower()
+                if any(x in low for x in ["cdn","media","image","product","gallery","upload"]):
+                    if not any(x in low for x in ["_50","_100","_150","_200","thumb","logo","icon"]):
+                        add(u)
+
+    # Strategy 2 — JSON-LD Product schema (all image URLs in the blob)
+    if len(image_urls) < 2:
+        for script in soup.find_all("script", type="application/ld+json"):
+            try:
+                data = json.loads(script.string or "")
+                blob = json.dumps(data)
+                for u in re.findall(
+                    r'https://[^\s"\'\\]+\.(?:jpg|jpeg|png|webp)',
+                    blob, re.IGNORECASE,
+                ):
+                    add(u)
+            except Exception:
+                pass
 
     # Strategy 3 — og:image meta tags
-    for m in soup.find_all("meta", property=re.compile(r"og:image", re.I)):
-        add(m.get("content", ""))
+    if len(image_urls) < 2:
+        for m in soup.find_all("meta", property=re.compile(r"og:image", re.I)):
+            add(m.get("content", ""))
 
-    # Strategy 4 — img tags (fallback)
+    # Strategy 4 — img tags (last-resort fallback)
     if len(image_urls) < 2:
         for img in soup.find_all("img"):
             src = (
@@ -287,7 +329,17 @@ def crawl_page(url: str):
                 pass
             add(urljoin(url, src))
 
-    return product_name, image_urls[:12]
+    # ── Natural sort: main image first, then numeric order (…-1, -2, … -10, -11) ──
+    def _sort_key(u: str):
+        fname = u.rsplit("/", 1)[-1].lower()
+        if "-mn" in fname or "main" in fname or "-1s" in fname:
+            return (0, 0)
+        m = re.search(r"(\d+)(?=\.\w+$)", fname)
+        return (1, int(m.group(1)) if m else 9999)
+
+    image_urls.sort(key=_sort_key)
+
+    return product_name, image_urls[:24]
 
 
 # ── Image Processing ───────────────────────────────────────────────────────────
@@ -521,8 +573,8 @@ if crawl:
 
         # ── Quality slider ──
         quality = st.slider(
-            "AVIF Quality", 70, 95, 85, 5, key="quality",
-            help="85 = excellent quality. 90–95 = near-lossless (larger files).",
+            "AVIF Quality", 70, 95, 90, 5, key="quality",
+            help="90 = near-lossless default. 85 = excellent / smaller files.",
         )
 
         # ── Process button ──
