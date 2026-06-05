@@ -427,24 +427,58 @@ with st.expander("📎 Or paste direct image URLs (one per line)", expanded=Fals
     )
     use_manual = st.button("Use these URLs →", type="secondary")
 
-# ── Resolve input source ──
-active_url       = ""
-active_img_urls  = []
-active_name      = ""
-triggered        = False
+
+# ── Resolve input source → store crawl result in session_state ──────────────────
+# NOTE: results are kept in st.session_state so they survive the reruns that
+# Streamlit triggers on every button click (e.g. the Process button). Without
+# this, the crawl state would reset and "Process" could never execute.
+
+def run_crawl(url: str, img_urls: list, name: str):
+    """Crawl (if needed), validate, and stash results in session_state."""
+    if not img_urls:
+        with st.spinner("Crawling product page…"):
+            try:
+                name, img_urls = crawl_page(url)
+            except Exception as e:
+                st.error(f"❌ Crawl failed: {e}")
+                return
+    if not img_urls:
+        st.error(
+            "No product images found. The site may be client-rendered. "
+            "Try pasting direct image URLs in the manual section above."
+        )
+        return
+
+    color = extract_color(name, url)
+    slug  = slugify(name or urlparse(url).path.split("/")[-1] or "product")
+    st.session_state["crawl"] = {
+        "url": url, "name": name, "img_urls": img_urls,
+        "color": color, "slug": slug,
+    }
+    # New crawl invalidates any previous processing output
+    st.session_state.pop("result", None)
+    st.session_state.pop("confirm_reprocess", None)
+
 
 if go and url_input:
-    active_url  = url_input.strip()
-    triggered   = True
+    run_crawl(url_input.strip(), [], "")
 elif use_manual and manual_urls_raw:
-    active_img_urls = [u.strip() for u in manual_urls_raw.strip().splitlines() if u.strip()]
-    active_name     = manual_name.strip() or "Product"
-    active_url      = active_img_urls[0]  # use first URL as record key
-    triggered       = True
+    m_urls = [u.strip() for u in manual_urls_raw.strip().splitlines() if u.strip()]
+    run_crawl(m_urls[0] if m_urls else "", m_urls, manual_name.strip() or "Product")
 
-if triggered:
+
+# ── Render crawl results + selection + processing (state-persistent) ────────────
+crawl = st.session_state.get("crawl")
+if crawl:
+    active_url      = crawl["url"]
+    active_img_urls = crawl["img_urls"]
+    active_name     = crawl["name"]
+    color           = crawl["color"]
+    slug            = crawl["slug"]
+
     # ── Duplicate check ──
     existing = get_record(active_url)
+    proceed  = True
     if existing:
         st.markdown(
             f"""<div class="dup-box">
@@ -454,163 +488,163 @@ if triggered:
             </div>""",
             unsafe_allow_html=True,
         )
-        reprocess = st.checkbox("Re-process anyway (overwrites previous record)")
-        if not reprocess:
-            st.stop()
-
-    # ── Crawl (unless manual mode) ──
-    if not active_img_urls:
-        with st.spinner("Crawling product page…"):
-            try:
-                active_name, active_img_urls = crawl_page(active_url)
-            except Exception as e:
-                st.error(f"❌ Crawl failed: {e}")
-                st.stop()
-
-    if not active_img_urls:
-        st.error(
-            "No product images found. The site may be client-rendered. "
-            "Try pasting direct image URLs in the manual section above."
+        proceed = st.checkbox(
+            "Re-process anyway (overwrites previous record)",
+            key="confirm_reprocess",
         )
-        st.stop()
 
-    color = extract_color(active_name, active_url)
-    slug  = slugify(active_name or urlparse(active_url).path.split("/")[-1] or "product")
+    if proceed:
+        st.success(
+            f"Found **{len(active_img_urls)} images** · "
+            f"Product: **{active_name or '—'}** · "
+            f"Colour detected: **{color or 'none'}**"
+        )
 
-    st.success(
-        f"Found **{len(active_img_urls)} images** · "
-        f"Product: **{active_name or '—'}** · "
-        f"Colour detected: **{color or 'none'}**"
-    )
+        # ── Image preview + selection ──
+        st.subheader("Select images to include")
+        COLS = 4
+        rows = [active_img_urls[i:i+COLS] for i in range(0, len(active_img_urls), COLS)]
 
-    # ── Image preview + selection ──
-    st.subheader("Select images to include")
-    COLS = 4
-    rows = [active_img_urls[i:i+COLS] for i in range(0, len(active_img_urls), COLS)]
-    selected_indices: list[int] = []
+        for row_i, row in enumerate(rows):
+            cols = st.columns(COLS)
+            for col_i, img_url in enumerate(row):
+                abs_i = row_i * COLS + col_i
+                with cols[col_i]:
+                    try:
+                        preview = fetch_image(img_url)
+                        st.image(preview, use_container_width=True)
+                    except Exception:
+                        st.caption("⚠️ Preview unavailable")
+                    st.checkbox(f"#{abs_i + 1}", value=True, key=f"chk_{abs_i}")
 
-    for row_i, row in enumerate(rows):
-        cols = st.columns(COLS)
-        for col_i, img_url in enumerate(row):
-            abs_i = row_i * COLS + col_i
-            with cols[col_i]:
-                try:
-                    preview = fetch_image(img_url)
-                    st.image(preview, use_container_width=True)
-                except Exception:
-                    st.caption("⚠️ Preview unavailable")
-                if st.checkbox(f"#{abs_i + 1}", value=True, key=f"chk_{abs_i}"):
-                    selected_indices.append(abs_i)
+        st.divider()
 
-    st.divider()
+        # ── Quality slider ──
+        quality = st.slider(
+            "AVIF Quality", 70, 95, 85, 5, key="quality",
+            help="85 = excellent quality. 90–95 = near-lossless (larger files).",
+        )
 
-    # ── Quality slider ──
-    quality = st.slider(
-        "AVIF Quality", 70, 95, 85, 5,
-        help="85 = excellent quality. 90–95 = near-lossless (larger files).",
-    )
+        # ── Process button ──
+        if st.button("⚡ Process Selected Images", type="primary"):
+            selected_indices = [
+                i for i in range(len(active_img_urls))
+                if st.session_state.get(f"chk_{i}", True)
+            ]
+            chosen = [(i, active_img_urls[i]) for i in selected_indices]
 
-    # ── Process button ──
-    if st.button("⚡ Process Selected Images", type="primary"):
-        chosen = [(i, active_img_urls[i]) for i in selected_indices]
-        if not chosen:
-            st.warning("No images selected.")
-            st.stop()
+            if not chosen:
+                st.warning("No images selected.")
+            else:
+                avif_results: list = []   # [(filename, bytes), ...]
+                all_alts:     list = []   # [{alt_kw, alt_ae, alt_in, alt_gb}, ...]
+                filenames:    list = []
+                errors:       list = []
 
-        avif_results: list[tuple[str, bytes]] = []
-        all_alts:     list[dict]  = []   # [{alt_kw, alt_ae, alt_in, alt_gb}, ...]
-        filenames:    list[str]   = []
-        errors:       list[str]   = []
+                prog = st.progress(0.0, text="Starting…")
+                status_box = st.empty()
 
-        prog = st.progress(0.0, text="Starting…")
-        status_box = st.empty()
+                for step, (orig_i, img_url) in enumerate(chosen):
+                    prog.progress(step / len(chosen), text=f"Image {step + 1}/{len(chosen)}…")
+                    status_box.caption(f"Processing: {img_url[:80]}…")
+                    try:
+                        raw       = fetch_image(img_url)
+                        avif_data = to_avif(raw, quality)
+                        fname     = f"{slug}_{orig_i + 1:02d}.avif"
+                        alts      = make_all_alts(active_name or "Product", color, orig_i)
+                        avif_results.append((fname, avif_data))
+                        all_alts.append(alts)
+                        filenames.append(fname)
+                    except Exception as e:
+                        errors.append(f"Image #{orig_i + 1}: {e}")
 
-        for step, (orig_i, img_url) in enumerate(chosen):
-            prog.progress(step / len(chosen), text=f"Image {step + 1}/{len(chosen)}…")
-            status_box.caption(f"Processing: {img_url[:80]}…")
-            try:
-                raw       = fetch_image(img_url)
-                avif_data = to_avif(raw, quality)
-                fname     = f"{slug}_{orig_i + 1:02d}.avif"
-                alts      = make_all_alts(active_name or "Product", color, orig_i)
-                avif_results.append((fname, avif_data))
-                all_alts.append(alts)
-                filenames.append(fname)
-            except Exception as e:
-                errors.append(f"Image #{orig_i + 1}: {e}")
+                prog.progress(1.0, text="Done!")
+                status_box.empty()
 
-        prog.progress(1.0, text="Done!")
-        status_box.empty()
+                for err in errors:
+                    st.warning(f"⚠️ {err}")
 
-        for err in errors:
-            st.warning(f"⚠️ {err}")
+                if avif_results:
+                    # Save to local disk
+                    out_dir = os.path.join(OUTPUT_DIR, slug)
+                    os.makedirs(out_dir, exist_ok=True)
+                    for fname, data in avif_results:
+                        with open(os.path.join(out_dir, fname), "wb") as f:
+                            f.write(data)
 
-        if avif_results:
-            # Save to local disk
-            out_dir = os.path.join(OUTPUT_DIR, slug)
-            os.makedirs(out_dir, exist_ok=True)
-            for fname, data in avif_results:
-                with open(os.path.join(out_dir, fname), "wb") as f:
-                    f.write(data)
+                    # Record in DB (store KW alt as the primary reference)
+                    kw_alts = [a["alt_kw"] for a in all_alts]
+                    save_record(active_url, active_name, len(avif_results), kw_alts, filenames)
 
-            # Record in DB (store KW alt as the primary reference)
-            kw_alts = [a["alt_kw"] for a in all_alts]
-            save_record(active_url, active_name, len(avif_results), kw_alts, filenames)
+                    # Build multi-region alt text CSV
+                    csv_rows = ["filename,alt_kw,alt_ae,alt_in,alt_gb"]
+                    for fname, alts in zip(filenames, all_alts):
+                        csv_rows.append(
+                            f'"{fname}",'
+                            f'"{alts["alt_kw"]}",'
+                            f'"{alts["alt_ae"]}",'
+                            f'"{alts["alt_in"]}",'
+                            f'"{alts["alt_gb"]}"'
+                        )
+                    csv_content = "\n".join(csv_rows)
 
-            # Build multi-region alt text CSV
-            csv_rows = ["filename,alt_kw,alt_ae,alt_in,alt_gb"]
-            for fname, alts in zip(filenames, all_alts):
-                csv_rows.append(
-                    f'"{fname}",'
-                    f'"{alts["alt_kw"]}",'
-                    f'"{alts["alt_ae"]}",'
-                    f'"{alts["alt_in"]}",'
-                    f'"{alts["alt_gb"]}"'
-                )
-            csv_content = "\n".join(csv_rows)
+                    # Build ZIP
+                    zip_buf = io.BytesIO()
+                    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                        for fname, data in avif_results:
+                            zf.writestr(fname, data)
+                        zf.writestr("alt_texts.csv", csv_content)
+                    zip_buf.seek(0)
 
-            # Build ZIP
-            zip_buf = io.BytesIO()
-            with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
-                for fname, data in avif_results:
-                    zf.writestr(fname, data)
-                zf.writestr("alt_texts.csv", csv_content)
-            zip_buf.seek(0)
+                    # Persist the result so the download button (which triggers a
+                    # rerun) and subsequent reruns keep showing it.
+                    st.session_state["result"] = {
+                        "zip":       zip_buf.getvalue(),
+                        "slug":      slug,
+                        "count":     len(avif_results),
+                        "quality":   quality,
+                        "filenames": filenames,
+                        "all_alts":  all_alts,
+                    }
+                else:
+                    st.error("No images could be processed. See warnings above.")
 
-            # Results
-            st.markdown(
-                f"""<div class="ok-box">
-                ✅ <strong>{len(avif_results)} AVIF images ready</strong> —
-                1200×1200 · Quality {quality} · ZIP includes alt_texts.csv (4 regions)
-                </div>""",
-                unsafe_allow_html=True,
-            )
+    # ── Render processing result (persists across the download-button rerun) ──
+    result = st.session_state.get("result")
+    if result:
+        st.markdown(
+            f"""<div class="ok-box">
+            ✅ <strong>{result["count"]} AVIF images ready</strong> —
+            1200×1200 · Quality {result["quality"]} · ZIP includes alt_texts.csv (4 regions)
+            </div>""",
+            unsafe_allow_html=True,
+        )
 
-            # Alt text preview table
-            st.subheader("Generated Alt Texts — All Regions")
-            preview_data = []
-            for fname, alts in zip(filenames, all_alts):
-                preview_data.append({
-                    "File":   fname,
-                    "🇰🇼 KW": alts["alt_kw"],
-                    "🇦🇪 AE": alts["alt_ae"],
-                    "🇮🇳 IN": alts["alt_in"],
-                    "🌐 GB":  alts["alt_gb"],
-                })
-            st.dataframe(
-                pd.DataFrame(preview_data),
-                use_container_width=True,
-                hide_index=True,
-            )
+        # Alt text preview table
+        st.subheader("Generated Alt Texts — All Regions")
+        preview_data = []
+        for fname, alts in zip(result["filenames"], result["all_alts"]):
+            preview_data.append({
+                "File":   fname,
+                "🇰🇼 KW": alts["alt_kw"],
+                "🇦🇪 AE": alts["alt_ae"],
+                "🇮🇳 IN": alts["alt_in"],
+                "🌐 GB":  alts["alt_gb"],
+            })
+        st.dataframe(
+            pd.DataFrame(preview_data),
+            use_container_width=True,
+            hide_index=True,
+        )
 
-            st.download_button(
-                label=f"⬇️ Download {slug}_avif.zip",
-                data=zip_buf.getvalue(),
-                file_name=f"{slug}_avif.zip",
-                mime="application/zip",
-                type="primary",
-                use_container_width=True,
-            )
+        st.download_button(
+            label=f"⬇️ Download {result['slug']}_avif.zip",
+            data=result["zip"],
+            file_name=f"{result['slug']}_avif.zip",
+            mime="application/zip",
+            type="primary",
+            use_container_width=True,
+        )
 
 # ── Processing History ─────────────────────────────────────────────────────────
 st.divider()
