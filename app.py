@@ -392,17 +392,22 @@ def to_avif(raw: bytes, quality: int = AVIF_QUALITY) -> bytes:
     return buf.getvalue()
 
 
-# ── AI Vision Alt Text ─────────────────────────────────────────────────────────
-# Default to a fast, cheap vision-capable model; override via secrets if needed.
-VISION_MODEL = "claude-haiku-4-5-20251001"
+# ── AI Vision Alt Text (Google Gemini) ──────────────────────────────────────────
+# Free-tier vision model; override via the VISION_MODEL secret if needed.
+VISION_MODEL = "gemini-2.0-flash"
 
 
-def _anthropic_key() -> str:
-    try:
-        k = st.secrets.get("ANTHROPIC_API_KEY", "")
-    except Exception:
-        k = ""
-    return k or os.environ.get("ANTHROPIC_API_KEY", "")
+def _gemini_key() -> str:
+    """Read the Gemini key from secrets / env (accepts a few common names)."""
+    for name in ("GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_AI_API_KEY"):
+        try:
+            k = st.secrets.get(name, "")
+        except Exception:
+            k = ""
+        k = k or os.environ.get(name, "")
+        if k:
+            return k
+    return ""
 
 
 def _vision_model() -> str:
@@ -414,24 +419,25 @@ def _vision_model() -> str:
 
 
 def ai_alt_enabled() -> bool:
-    return bool(_anthropic_key())
+    return bool(_gemini_key())
 
 
 @st.cache_data(show_spinner=False)
 def describe_image(img_bytes: bytes, product_name: str) -> str:
-    """Use Claude vision to produce a short phrase describing THIS image's
+    """Use Google Gemini vision to produce a short phrase describing THIS image's
     actual content (angle / view / notable detail / setting). Returns '' on any
     failure so the caller can fall back to a generic positional label.
     Cached per (image, product) so re-processing doesn't re-bill the API."""
-    key = _anthropic_key()
+    key = _gemini_key()
     if not key:
         return ""
     try:
-        import anthropic
+        from google import genai
+        from google.genai import types
     except Exception:
         return ""
 
-    # Detect media type from magic bytes (Claude accepts jpeg/png/webp/gif).
+    # Detect media type from magic bytes (Gemini accepts jpeg/png/webp/gif).
     media = "image/jpeg"
     if img_bytes[:8].startswith(b"\x89PNG"):
         media = "image/png"
@@ -440,33 +446,27 @@ def describe_image(img_bytes: bytes, product_name: str) -> str:
     elif img_bytes[:6] in (b"GIF87a", b"GIF89a"):
         media = "image/gif"
 
+    prompt = (
+        f"This is one product photo of '{product_name}'. In 4 to 9 words, "
+        "describe what THIS specific image shows: the camera angle/view and any "
+        "notable visible detail or setting. Examples: 'back view showing dual "
+        "camera cutout', 'held in hand outdoors', 'close-up of textured side "
+        "grip', 'front and back shown side by side'. Do NOT include the product "
+        "name, brand, or colour. No quotation marks. Reply with only the phrase."
+    )
     try:
-        client = anthropic.Anthropic(api_key=key)
-        b64 = base64.standard_b64encode(img_bytes).decode("ascii")
-        prompt = (
-            f"This is one product photo of '{product_name}'. In 4 to 9 words, "
-            "describe what THIS specific image shows: the camera angle/view and any "
-            "notable visible detail or setting. Examples: 'back view showing dual "
-            "camera cutout', 'held in hand outdoors', 'close-up of textured side "
-            "grip', 'front and back shown side by side'. Do NOT include the product "
-            "name, brand, or colour. No quotation marks. Reply with only the phrase."
-        )
-        msg = client.messages.create(
+        client = genai.Client(api_key=key)
+        resp = client.models.generate_content(
             model=_vision_model(),
-            max_tokens=40,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"type": "image", "source": {
-                        "type": "base64", "media_type": media, "data": b64}},
-                    {"type": "text", "text": prompt},
-                ],
-            }],
+            contents=[
+                prompt,
+                types.Part.from_bytes(data=img_bytes, mime_type=media),
+            ],
+            config=types.GenerateContentConfig(
+                max_output_tokens=40, temperature=0.4,
+            ),
         )
-        txt = "".join(
-            getattr(b, "text", "") for b in msg.content
-            if getattr(b, "type", "") == "text"
-        ).strip()
+        txt = (getattr(resp, "text", "") or "").strip()
         txt = txt.strip().strip('"').strip("'").rstrip(".").strip()
         return txt[:90]
     except Exception:
@@ -553,11 +553,11 @@ st.caption(
     "Convert to AVIF · Generate alt text · Download ZIP · Track duplicates"
 )
 if ai_alt_enabled():
-    st.caption("✨ AI alt text: **ON** — descriptions are generated from each actual image.")
+    st.caption("✨ AI alt text: **ON** (Gemini) — descriptions are generated from each actual image.")
 else:
     st.caption(
         "⚙️ AI alt text: **off** — using generic view labels. "
-        "Add `ANTHROPIC_API_KEY` in the app's Settings → Secrets to describe real image content."
+        "Add a free `GEMINI_API_KEY` in the app's Settings → Secrets to describe real image content."
     )
 st.divider()
 
@@ -731,7 +731,7 @@ if crawl:
                 if use_ai and avif_results and ai_hits == 0:
                     st.warning(
                         "⚠️ AI alt text was enabled but every description failed — "
-                        "fell back to generic view labels. Check that `ANTHROPIC_API_KEY` "
+                        "fell back to generic view labels. Check that `GEMINI_API_KEY` "
                         "is valid and the `VISION_MODEL` is available on your account."
                     )
 
