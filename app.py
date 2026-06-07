@@ -422,20 +422,11 @@ def ai_alt_enabled() -> bool:
     return bool(_gemini_key())
 
 
-@st.cache_data(show_spinner=False)
-def describe_image(img_bytes: bytes, product_name: str) -> str:
-    """Use Google Gemini vision to produce a short phrase describing THIS image's
-    actual content (angle / view / notable detail / setting). Returns '' on any
-    failure so the caller can fall back to a generic positional label.
-    Cached per (image, product) so re-processing doesn't re-bill the API."""
-    key = _gemini_key()
-    if not key:
-        return ""
-    try:
-        from google import genai
-        from google.genai import types
-    except Exception:
-        return ""
+def _gemini_describe(img_bytes: bytes, product_name: str) -> str:
+    """Core Gemini vision call. MAY RAISE — used by both the cached wrapper and
+    the diagnostic self-test so the real error is visible when something breaks."""
+    from google import genai
+    from google.genai import types
 
     # Detect media type from magic bytes (Gemini accepts jpeg/png/webp/gif).
     media = "image/jpeg"
@@ -454,21 +445,30 @@ def describe_image(img_bytes: bytes, product_name: str) -> str:
         "grip', 'front and back shown side by side'. Do NOT include the product "
         "name, brand, or colour. No quotation marks. Reply with only the phrase."
     )
+    client = genai.Client(api_key=_gemini_key())
+    resp = client.models.generate_content(
+        model=_vision_model(),
+        contents=[
+            prompt,
+            types.Part.from_bytes(data=img_bytes, mime_type=media),
+        ],
+        config=types.GenerateContentConfig(
+            max_output_tokens=40, temperature=0.4,
+        ),
+    )
+    txt = (getattr(resp, "text", "") or "").strip()
+    txt = txt.strip().strip('"').strip("'").rstrip(".").strip()
+    return txt[:90]
+
+
+@st.cache_data(show_spinner=False)
+def describe_image(img_bytes: bytes, product_name: str) -> str:
+    """Cached, safe wrapper. Returns '' on any failure so the caller can fall
+    back to a generic positional label. Cached per (image, product)."""
+    if not _gemini_key():
+        return ""
     try:
-        client = genai.Client(api_key=key)
-        resp = client.models.generate_content(
-            model=_vision_model(),
-            contents=[
-                prompt,
-                types.Part.from_bytes(data=img_bytes, mime_type=media),
-            ],
-            config=types.GenerateContentConfig(
-                max_output_tokens=40, temperature=0.4,
-            ),
-        )
-        txt = (getattr(resp, "text", "") or "").strip()
-        txt = txt.strip().strip('"').strip("'").rstrip(".").strip()
-        return txt[:90]
+        return _gemini_describe(img_bytes, product_name)
     except Exception:
         return ""
 
@@ -554,6 +554,16 @@ st.caption(
 )
 if ai_alt_enabled():
     st.caption("✨ AI alt text: **ON** (Gemini) — descriptions are generated from each actual image.")
+    with st.expander("🔧 Test AI alt-text connection"):
+        st.caption(f"Model: `{_vision_model()}` · API key detected: **yes**")
+        if st.button("Run AI test"):
+            buf = io.BytesIO()
+            Image.new("RGB", (96, 96), (210, 90, 80)).save(buf, format="JPEG")
+            try:
+                out = _gemini_describe(buf.getvalue(), "Test product")
+                st.success(f'✅ Gemini responded: "{out or "(empty response)"}"')
+            except Exception as e:
+                st.error(f"❌ Gemini call failed:\n\n**{type(e).__name__}**: {e}")
 else:
     st.caption(
         "⚙️ AI alt text: **off** — using generic view labels. "
