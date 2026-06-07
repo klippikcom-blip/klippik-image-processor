@@ -32,11 +32,6 @@ from PIL import Image
 TARGET_SIZE  = (1200, 1200)
 AVIF_QUALITY = 90          # default; user can adjust via slider
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH    = os.path.join(SCRIPT_DIR, "klippik_image_records.db")
-OUTPUT_DIR = os.path.join(SCRIPT_DIR, "avif_output")
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -76,111 +71,10 @@ REGION_SUFFIX = {
 }
 
 
-# ── Database (Supabase or SQLite) ──────────────────────────────────────────────
-
-def _use_supabase() -> bool:
-    try:
-        url = st.secrets.get("SUPABASE_URL", "")
-        key = st.secrets.get("SUPABASE_KEY", "")
-        return bool(url and key)
-    except Exception:
-        return False
-
-
-@st.cache_resource
-def _supabase_client():
-    from supabase import create_client          # type: ignore
-    return create_client(
-        st.secrets["SUPABASE_URL"],
-        st.secrets["SUPABASE_KEY"],
-    )
-
-
-def init_db():
-    """Create SQLite table if it doesn't exist (local mode only)."""
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS products (
-            id            INTEGER PRIMARY KEY AUTOINCREMENT,
-            url           TEXT    UNIQUE,
-            product_name  TEXT,
-            image_count   INTEGER,
-            processed_at  TEXT,
-            alt_texts     TEXT,
-            filenames     TEXT
-        )
-    """)
-    conn.commit()
-    conn.close()
-
-
-def get_record(url: str):
-    """Return existing record dict or None."""
-    url = url.rstrip("/")
-    if _use_supabase():
-        sb  = _supabase_client()
-        res = sb.table("products").select("*").eq("url", url).execute()
-        return res.data[0] if res.data else None
-    conn = sqlite3.connect(DB_PATH)
-    row  = conn.execute(
-        "SELECT url,product_name,image_count,processed_at,alt_texts,filenames "
-        "FROM products WHERE url=?", (url,)
-    ).fetchone()
-    conn.close()
-    if row:
-        return dict(zip(
-            ["url","product_name","image_count","processed_at","alt_texts","filenames"],
-            row,
-        ))
-    return None
-
-
-def save_record(url, product_name, image_count, alt_texts, filenames):
-    url  = url.rstrip("/")
-    now  = datetime.now().strftime("%Y-%m-%d %H:%M")
-    data = {
-        "url":          url,
-        "product_name": product_name,
-        "image_count":  image_count,
-        "processed_at": now,
-        "alt_texts":    json.dumps(alt_texts),
-        "filenames":    json.dumps(filenames),
-    }
-    if _use_supabase():
-        _supabase_client().table("products").upsert(
-            data, on_conflict="url"
-        ).execute()
-        return
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("""
-        INSERT OR REPLACE INTO products
-            (url,product_name,image_count,processed_at,alt_texts,filenames)
-        VALUES (:url,:product_name,:image_count,:processed_at,:alt_texts,:filenames)
-    """, data)
-    conn.commit()
-    conn.close()
-
-
-def get_all_records():
-    if _use_supabase():
-        res = (
-            _supabase_client()
-            .table("products")
-            .select("url,product_name,image_count,processed_at")
-            .order("processed_at", desc=True)
-            .execute()
-        )
-        return [
-            (r["url"], r["product_name"], r["image_count"], r["processed_at"])
-            for r in res.data
-        ]
-    conn  = sqlite3.connect(DB_PATH)
-    rows  = conn.execute(
-        "SELECT url,product_name,image_count,processed_at "
-        "FROM products ORDER BY processed_at DESC"
-    ).fetchall()
-    conn.close()
-    return rows
+# ── No history / no tracking ────────────────────────────────────────────────────
+# Duplicate tracking and processing history were removed entirely: this app is
+# public, and nothing about what gets processed is stored anywhere (no database,
+# no Supabase, no on-disk record). Each run is stateless.
 
 
 # ── Image Crawling ─────────────────────────────────────────────────────────────
@@ -580,10 +474,6 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# Initialise local DB if not using Supabase
-if not _use_supabase():
-    init_db()
-
 # ── Header ──
 st.title("🖼️ KlippiK Image Processor")
 st.caption(
@@ -682,7 +572,6 @@ def run_crawl(url: str, img_urls: list, name: str):
     }
     # New crawl invalidates any previous processing output
     st.session_state.pop("result", None)
-    st.session_state.pop("confirm_reprocess", None)
 
 
 if go and url_input:
@@ -701,24 +590,8 @@ if crawl:
     color           = crawl["color"]
     slug            = crawl["slug"]
 
-    # ── Duplicate check ──
-    existing = get_record(active_url)
-    proceed  = True
-    if existing:
-        st.markdown(
-            f"""<div class="dup-box">
-            ⚠️ <strong>Already processed on {existing["processed_at"]}</strong><br>
-            <b>Product:</b> {existing["product_name"]} &nbsp;|&nbsp;
-            <b>Images:</b> {existing["image_count"]} AVIF files saved
-            </div>""",
-            unsafe_allow_html=True,
-        )
-        proceed = st.checkbox(
-            "Re-process anyway (overwrites previous record)",
-            key="confirm_reprocess",
-        )
-
-    if proceed:
+    # No duplicate check — nothing is tracked or stored, so every crawl proceeds.
+    if True:
         st.success(
             f"Found **{len(active_img_urls)} images** · "
             f"Product: **{active_name or '—'}** · "
@@ -805,16 +678,8 @@ if crawl:
                     )
 
                 if avif_results:
-                    # Save to local disk
-                    out_dir = os.path.join(OUTPUT_DIR, slug)
-                    os.makedirs(out_dir, exist_ok=True)
-                    for fname, data in avif_results:
-                        with open(os.path.join(out_dir, fname), "wb") as f:
-                            f.write(data)
-
-                    # Record in DB (store KW alt as the primary reference)
-                    kw_alts = [a["alt_kw"] for a in all_alts]
-                    save_record(active_url, active_name, len(avif_results), kw_alts, filenames)
+                    # Nothing is written to disk or any database — results are
+                    # held in memory and delivered only via the ZIP download.
 
                     # Build multi-region alt text CSV
                     csv_rows = ["filename,alt_kw,alt_ae,alt_in,alt_gb"]
@@ -886,8 +751,6 @@ if crawl:
             use_container_width=True,
         )
 
-# ── Processing History ─────────────────────────────────────────────────────────
-# The history table is intentionally NOT displayed: this app is public, so the
-# processing history must not be visible to visitors. Duplicate tracking still
-# runs in the background (get_record / save_record) so the "already processed"
-# warning keeps working — the data is simply not shown in the UI.
+# ── No processing history ───────────────────────────────────────────────────────
+# History and duplicate tracking were removed entirely. Nothing about processed
+# products is stored on the server, so there is no history to display or leak.
