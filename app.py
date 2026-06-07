@@ -393,8 +393,19 @@ def to_avif(raw: bytes, quality: int = AVIF_QUALITY) -> bytes:
 
 
 # ── AI Vision Alt Text (Google Gemini) ──────────────────────────────────────────
-# Free-tier vision model; override via the VISION_MODEL secret if needed.
-VISION_MODEL = "gemini-2.0-flash"
+# Free-tier quota varies by model/region. We try several models in order and use
+# the first one the account allows; a forced VISION_MODEL secret overrides this.
+CANDIDATE_MODELS = [
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-lite",
+    "gemini-1.5-flash",
+    "gemini-1.5-flash-8b",
+]
+
+# Remembered across reruns (module-level, NOT session_state — safe inside cache).
+_GOOD_MODEL = None
 
 
 def _gemini_key() -> str:
@@ -410,32 +421,44 @@ def _gemini_key() -> str:
     return ""
 
 
-def _vision_model() -> str:
+def _forced_model() -> str:
     try:
         m = st.secrets.get("VISION_MODEL", "")
     except Exception:
         m = ""
-    return m or os.environ.get("VISION_MODEL", "") or VISION_MODEL
+    return m or os.environ.get("VISION_MODEL", "")
+
+
+def _model_order() -> list:
+    """Models to try, best-known-working first."""
+    forced = _forced_model()
+    if forced:
+        return [forced]
+    order = []
+    if _GOOD_MODEL:
+        order.append(_GOOD_MODEL)
+    order += [m for m in CANDIDATE_MODELS if m != _GOOD_MODEL]
+    return order
 
 
 def ai_alt_enabled() -> bool:
     return bool(_gemini_key())
 
 
-def _gemini_describe(img_bytes: bytes, product_name: str) -> str:
-    """Core Gemini vision call. MAY RAISE — used by both the cached wrapper and
-    the diagnostic self-test so the real error is visible when something breaks."""
+def _detect_media(img_bytes: bytes) -> str:
+    if img_bytes[:8].startswith(b"\x89PNG"):
+        return "image/png"
+    if img_bytes[:4] == b"RIFF" and img_bytes[8:12] == b"WEBP":
+        return "image/webp"
+    if img_bytes[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    return "image/jpeg"
+
+
+def _call_gemini(img_bytes: bytes, product_name: str, model: str) -> str:
+    """Single Gemini call against one model. MAY RAISE."""
     from google import genai
     from google.genai import types
-
-    # Detect media type from magic bytes (Gemini accepts jpeg/png/webp/gif).
-    media = "image/jpeg"
-    if img_bytes[:8].startswith(b"\x89PNG"):
-        media = "image/png"
-    elif img_bytes[:4] == b"RIFF" and img_bytes[8:12] == b"WEBP":
-        media = "image/webp"
-    elif img_bytes[:6] in (b"GIF87a", b"GIF89a"):
-        media = "image/gif"
 
     prompt = (
         f"This is one product photo of '{product_name}'. In 4 to 9 words, "
@@ -447,18 +470,33 @@ def _gemini_describe(img_bytes: bytes, product_name: str) -> str:
     )
     client = genai.Client(api_key=_gemini_key())
     resp = client.models.generate_content(
-        model=_vision_model(),
+        model=model,
         contents=[
             prompt,
-            types.Part.from_bytes(data=img_bytes, mime_type=media),
+            types.Part.from_bytes(data=img_bytes, mime_type=_detect_media(img_bytes)),
         ],
-        config=types.GenerateContentConfig(
-            max_output_tokens=40, temperature=0.4,
-        ),
+        config=types.GenerateContentConfig(max_output_tokens=40, temperature=0.4),
     )
     txt = (getattr(resp, "text", "") or "").strip()
-    txt = txt.strip().strip('"').strip("'").rstrip(".").strip()
-    return txt[:90]
+    return txt.strip('"').strip("'").rstrip(".").strip()[:90]
+
+
+def _gemini_describe(img_bytes: bytes, product_name: str) -> str:
+    """Try candidate models in order; return first success. MAY RAISE the last
+    error if every model fails (used by the diagnostic self-test)."""
+    global _GOOD_MODEL
+    last_err = None
+    for model in _model_order():
+        try:
+            txt = _call_gemini(img_bytes, product_name, model)
+            _GOOD_MODEL = model
+            return txt
+        except Exception as e:
+            last_err = e
+            continue
+    if last_err:
+        raise last_err
+    return ""
 
 
 @st.cache_data(show_spinner=False)
@@ -555,15 +593,36 @@ st.caption(
 if ai_alt_enabled():
     st.caption("✨ AI alt text: **ON** (Gemini) — descriptions are generated from each actual image.")
     with st.expander("🔧 Test AI alt-text connection"):
-        st.caption(f"Model: `{_vision_model()}` · API key detected: **yes**")
-        if st.button("Run AI test"):
+        forced = _forced_model()
+        st.caption(
+            f"API key detected: **yes** · "
+            + (f"Forced model: `{forced}`" if forced
+               else f"Auto-selecting from: {', '.join(CANDIDATE_MODELS)}")
+        )
+        if st.button("Run AI test (probe each model)"):
             buf = io.BytesIO()
             Image.new("RGB", (96, 96), (210, 90, 80)).save(buf, format="JPEG")
-            try:
-                out = _gemini_describe(buf.getvalue(), "Test product")
-                st.success(f'✅ Gemini responded: "{out or "(empty response)"}"')
-            except Exception as e:
-                st.error(f"❌ Gemini call failed:\n\n**{type(e).__name__}**: {e}")
+            test_bytes = buf.getvalue()
+            models = [forced] if forced else CANDIDATE_MODELS
+            any_ok = False
+            for mdl in models:
+                try:
+                    out = _call_gemini(test_bytes, "Test product", mdl)
+                    st.success(f'✅ `{mdl}` works — responded: "{out or "(empty)"}"')
+                    any_ok = True
+                except Exception as e:
+                    short = str(e)
+                    short = (short[:160] + "…") if len(short) > 160 else short
+                    st.error(f"❌ `{mdl}` → {type(e).__name__}: {short}")
+            if any_ok:
+                st.info("At least one model works — alt text will use it automatically.")
+            else:
+                st.warning(
+                    "No model is available on this key. The free tier likely isn't "
+                    "offered for your region/project. Options: enable pay-as-you-go "
+                    "billing on the Google AI project (Gemini Flash is ~$0.01 for many "
+                    "images), or use a different key."
+                )
 else:
     st.caption(
         "⚙️ AI alt text: **off** — using generic view labels. "
