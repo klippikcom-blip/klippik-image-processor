@@ -887,23 +887,7 @@ if crawl:
         )
 
 # ── Processing History ─────────────────────────────────────────────────────────
-st.divider()
-st.subheader("📋 Processing History")
-records = get_all_records()
-if records:
-    df = pd.DataFrame(
-        records, columns=["URL", "Product", "Images", "Processed At"]
-    )
-    st.dataframe(
-        df, use_container_width=True, hide_index=True,
-        column_config={"URL": st.column_config.LinkColumn("URL")},
-    )
-    csv_export = df.to_csv(index=False).encode()
-    st.download_button(
-        "⬇️ Export history CSV",
-        csv_export,
-        file_name="klippik_image_history.csv",
-        mime="text/csv",
-    )
-else:
-    st.caption("No products processed yet — paste a URL above to get started.")
+# The history table is intentionally NOT displayed: this app is public, so the
+# processing history must not be visible to visitors. Duplicate tracking still
+# runs in the background (get_record / save_record) so the "already processed"
+# warning keeps working — the data is simply not shown in the UI.
